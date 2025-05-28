@@ -1,3 +1,4 @@
+import Cap from '@cap.js/server';
 import {HttpStatusCode} from 'axios';
 import {NextFunction, Request, Response, Router} from 'express';
 import formidable from 'formidable';
@@ -29,19 +30,15 @@ if (process.env.ENABLE_PIPEDRIVE) {
                 return res.status(429).end();
             }
 
-            let referer = req.get('referer');
-            if (referer) {
-                // Remove trailing slash if it exists
-                referer = referer.replace(/\/$/, '');
-            }
+            const origin = req.get('origin');
 
             // CORS
             const corsWhiteList = getRequiredEnvVariable('CORS_ORIGIN').split(',');
-            if (corsWhiteList.includes(referer)) {
-                res.header('Access-Control-Allow-Origin', referer);
+            if (corsWhiteList.includes(origin)) {
+                res.setHeader('Access-Control-Allow-Origin', origin);
                 res.setHeader('Access-Control-Allow-Headers', '*');
             } else {
-                logger.info(`[POST] /contact-form -> ERROR: Origin not allowed`, {referer});
+                logger.info(`[POST] /contact-form -> ERROR: Origin not allowed`, {origin});
                 return res.status(HttpStatusCode.Forbidden).json({message: 'Origin not allowed'}).end();
             }
 
@@ -57,8 +54,19 @@ if (process.env.ENABLE_PIPEDRIVE) {
                 // sendEmail is a honeypot for bots
                 if (fields['sendEmail']) {
                     logger.info('Honeypot field sendEmail was filled out.', {time: new Date().toString(), fields, req});
-                    return res.status(400).send({message: 'human verification failed'}).end();
+                    return res.status(HttpStatusCode.BadRequest).send({message: 'human verification failed'}).end();
                 }
+
+                const token = fields['token'] as string;
+                if (!token || typeof token !== 'string' || !token.includes(':')) {
+                    return res.status(HttpStatusCode.BadRequest).send({message: 'Invalid or missing token.'}).end();
+                }
+                const {success} = await cap.validateToken(token);
+                if (!success) {
+                    logger.info(`[POST] /contact-form -> ERROR: Invalid CAPTCHA token`, {token});
+                    return res.status(HttpStatusCode.BadRequest).json({message: 'Invalid CAPTCHA token'}).end();
+                }
+                logger.info(`[POST] /contact-form -> CAPTCHA token validated successfully!`, {token});
 
                 const service = new PipedriveService();
                 let data: ContactForm;
@@ -89,6 +97,49 @@ if (process.env.ENABLE_PIPEDRIVE) {
     });
 }
 
+// CAP Captcha endpoints https://github.com/tiagorangel1/cap
+
+export const cap = new Cap({
+    tokens_store_path: '.data/tokensList.json',
+});
+
+router.use('/captcha', (req: Request, res: Response, next: NextFunction) => {
+    // This middleware will run for any route that starts with /captcha
+
+    const origin = req.get('origin');
+
+    // CORS
+    const corsWhiteList = getRequiredEnvVariable('CORS_ORIGIN').split(',');
+
+    if (corsWhiteList.includes(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Headers', '*');
+        if (req.method === 'OPTIONS') {
+            // End preflight request here!
+            return res.status(200).end();
+        }
+    } else {
+        logger.info(`[POST] /captcha -> ERROR: Origin not allowed`, {origin});
+        return res.status(HttpStatusCode.Forbidden).json({message: 'Origin not allowed'}).end();
+    }
+    next();
+});
+
+router.post('/captcha/challenge', (req, res) => {
+    res.json(cap.createChallenge());
+});
+
+router.post('/captcha/redeem', async (req, res) => {
+    const {token, solutions} = req.body;
+    if (!token || !solutions) {
+        res.status(400).json({error: 'Token and solutions are required.'});
+        return;
+    }
+    const answer = await cap.redeemChallenge({token, solutions});
+
+    res.send(answer);
+});
+
 router.get('/status/health', async (req: Request, res: Response) => {
     return res.status(200).send({status: 'ok'});
 });
@@ -106,7 +157,7 @@ router.use('/:target', async (req: Request, res: Response, next: NextFunction) =
     let target: Target = TargetManager.targets.get(req.params.target);
 
     // CORS
-    res.setHeader('Access-Control-Allow-Origin', target.origin ? target.origin : '*');
+    res.setHeader('Access-Control-Allow-Origin', target.origin);
     res.setHeader('Access-Control-Allow-Method', 'POST');
     res.setHeader('Access-Control-Allow-Headers', '*');
 
